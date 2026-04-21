@@ -39,6 +39,7 @@ class ChordNode:
         self.predecessor: Optional["ChordNode"] = None
 
         self.data_store: Dict[int, str] = {}
+        self.pending: Dict[str, List[tuple]]={}
 
     def __repr__(self) -> str:
         return f"ChordNode(name={self.node_name}, id={self.node_id})"
@@ -52,6 +53,22 @@ class ChordNode:
     def delete_local(self, key: int) -> None:
         if key in self.data_store:
             del self.data_store[key]
+
+    def recv_record(self, job: str, sort_val, raw_key: str, payload: str) -> None:
+        if job not in self.pending:
+            self.pending[job] = []
+        self.pending[job].append((sort_val, raw_key, payload))
+
+    def local_sort(self, job: str) -> None:
+        if job in self.pending:
+            self.pending[job].sort(key=lambda entry: (entry[0], entry[2]))
+
+    def get_records(self, job: str) -> List[tuple]:
+        return list(self.pending.get(job, []))
+
+    def drop_job(self, job: str) -> None:
+        if job in self.pending:
+            del self.pending[job]
 
 
 class ChordRing:
@@ -312,6 +329,68 @@ class DFS:
     def debug_where_is_page(self, filename: str, page_no: int) -> ChordNode:
         return self.chord.locate_successor(self._page_key(filename, page_no))
 
+    def _parse_csv(self, text: str) -> List[tuple]:
+        rows = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(",", 1)
+            if len(parts) != 2:
+                raise DFSException(f"bad line: '{line}'")
+            rec_key = parts[0].strip()
+            rec_val = parts[1].strip()
+            try:
+                sort_val = int(rec_key)
+            except ValueError:
+                sort_val = rec_key
+            rows.append((sort_val, rec_key, rec_val))
+        return rows
+
+    def _save_to_dfs(self, fname: str, text: str) -> None:
+        tmp = f"_tmp_{fname.replace('/', '_')}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        try:
+            self.touch(fname)
+            if text:
+                self.append(fname, tmp)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    def sort_file(self, filename: str, output_filename: str) -> None:
+        content = self.read_text(filename)
+        rows = self._parse_csv(content)
+        job = f"{filename}_{output_filename}"
+
+        for node in self.chord.nodes:
+            node.drop_job(job)
+
+        # route each record to the node responsible for hash(key)
+        for sort_val, rec_key, rec_val in rows:
+            hashed_key = self._hash(rec_key)
+            target_node = self.chord.locate_successor(hashed_key)
+            target_node.recv_record(job, sort_val, rec_key, rec_val)
+
+        # each node sorts its own chunk locally
+        all_records = []
+        for node in self.chord.nodes:
+            node.local_sort(job)
+            all_records.extend(node.get_records(job))
+
+        # merge into final sorted output
+        all_records.sort(key=lambda entry: (entry[0], entry[2]))
+
+        out = "\n".join(f"{rec_key},{rec_val}" for _, rec_key, rec_val in all_records)
+        if out:
+            out += "\n"
+
+        self._save_to_dfs(output_filename, out)
+
+        for node in self.chord.nodes:
+            node.drop_job(job)
+
 
 def demo():
     ring = ChordRing(m_bits=8)
@@ -360,6 +439,34 @@ def demo():
     print("FILES AFTER DELETE:", dfs.ls())
 
     ring.dump_ring()
+    with open("records_input.txt", "w", encoding="utf-8") as f:
+        f.write(
+            "50,z\n"
+            "10,a\n"
+            "30,x\n"
+            "20,b\n"
+            "30,alpha\n"
+        )
+
+    dfs.touch("records.csv")
+    dfs.append("records.csv", "records_input.txt")
+
+    print("UNSORTED INPUT:")
+    print(dfs.read_text("records.csv"))
+
+    dfs.sort_file("records.csv", "records_sorted.csv")
+
+    print("SORTED OUTPUT:")
+    print(dfs.read_text("records_sorted.csv"))
+
+    print("STAT(records_sorted.csv):")
+    print(json.dumps(dfs.stat("records_sorted.csv"), indent=2))
+
+    # quick check that output is actually sorted
+    sorted_text = dfs.read_text("records_sorted.csv")
+    keys = [int(line.split(",")[0]) for line in sorted_text.strip().splitlines()]
+    assert keys == sorted(keys), "FAIL: not sorted"
+    print("\ncorrectness check passed, keys:", keys)
 
 
 if __name__ == "__main__":
