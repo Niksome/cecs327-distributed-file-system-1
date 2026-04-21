@@ -27,10 +27,7 @@ class CorruptFileDFS(DFSException):
 
 
 class ChordNode:
-    """
-    Minimal Chord-like peer.
-    Stores keys that map to it as the successor node on the ring.
-    """
+    # Minimal Chord-like peer. Stores keys that map to it as the successor node on the ring.
 
     def __init__(self, node_name: str, m_bits: int = 8):
         self.node_name = node_name
@@ -138,9 +135,7 @@ class ChordRing:
 
 
 class DFS:
-    """
-    DFS layer on top of the Chord ring.
-    """
+    # DFS layer on top of the Chord ring.
 
     GLOBAL_INDEX_KEY_RAW = "global:file_index"
 
