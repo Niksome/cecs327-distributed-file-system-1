@@ -1,0 +1,371 @@
+import os
+import json
+import hashlib
+from bisect import bisect_left
+from typing import Dict, List, Optional, Any
+
+
+def sha1_int(value: str, bits: int = 160) -> int:
+    h = hashlib.sha1(value.encode("utf-8")).hexdigest()
+    return int(h, 16) % (2 ** bits)
+
+
+class DFSException(Exception):
+    pass
+
+
+class FileAlreadyExistsDFS(DFSException):
+    pass
+
+
+class FileNotFoundDFS(DFSException):
+    pass
+
+
+class CorruptFileDFS(DFSException):
+    pass
+
+
+class ChordNode:
+    """
+    Minimal Chord-like peer.
+    Stores keys that map to it as the successor node on the ring.
+    """
+
+    def __init__(self, node_name: str, m_bits: int = 8):
+        self.node_name = node_name
+        self.m_bits = m_bits
+        self.ring_size = 2 ** m_bits
+        self.node_id = sha1_int(node_name, bits=m_bits)
+
+        self.successor: Optional["ChordNode"] = None
+        self.predecessor: Optional["ChordNode"] = None
+
+        self.data_store: Dict[int, str] = {}
+
+    def __repr__(self) -> str:
+        return f"ChordNode(name={self.node_name}, id={self.node_id})"
+
+    def put_local(self, key: int, value: str) -> None:
+        self.data_store[key] = value
+
+    def get_local(self, key: int) -> Optional[str]:
+        return self.data_store.get(key)
+
+    def delete_local(self, key: int) -> None:
+        if key in self.data_store:
+            del self.data_store[key]
+
+
+class ChordRing:
+    # Simplified Chord ring manager. This handles successor lookup by sorting node IDs.
+
+    def __init__(self, m_bits: int = 8):
+        self.m_bits = m_bits
+        self.ring_size = 2 ** m_bits
+        self.nodes: List[ChordNode] = []
+
+    def add_node(self, node_name: str) -> ChordNode:
+        node = ChordNode(node_name, self.m_bits)
+
+        existing_ids = {n.node_id for n in self.nodes}
+        if node.node_id in existing_ids:
+            raise ValueError(
+                f"Hash collision for node '{node_name}' with id {node.node_id}. "
+                "Choose a different name or increase m_bits."
+            )
+
+        self.nodes.append(node)
+        self.nodes.sort(key=lambda n: n.node_id)
+        self._update_links()
+        self._rebalance_keys()
+        return node
+
+    def _update_links(self) -> None:
+        if not self.nodes:
+            return
+
+        for i, node in enumerate(self.nodes):
+            node.successor = self.nodes[(i + 1) % len(self.nodes)]
+            node.predecessor = self.nodes[(i - 1) % len(self.nodes)]
+
+    def _rebalance_keys(self) -> None:
+        #Reassign keys to their correct owners after topology change.
+        if not self.nodes:
+            return
+
+        all_items: Dict[int, str] = {}
+        for node in self.nodes:
+            all_items.update(node.data_store)
+            node.data_store = {}
+
+        for key, value in all_items.items():
+            owner = self.locate_successor(key)
+            owner.put_local(key, value)
+
+    def locate_successor(self, key: int) -> ChordNode:
+        if not self.nodes:
+            raise ValueError("Ring has no nodes")
+
+        node_ids = [n.node_id for n in self.nodes]
+        idx = bisect_left(node_ids, key)
+        if idx == len(self.nodes):
+            idx = 0
+        return self.nodes[idx]
+
+    def put(self, key: int, value: str) -> None:
+        owner = self.locate_successor(key)
+        owner.put_local(key, value)
+
+    def get(self, key: int) -> Optional[str]:
+        owner = self.locate_successor(key)
+        return owner.get_local(key)
+
+    def delete(self, key: int) -> None:
+        owner = self.locate_successor(key)
+        owner.delete_local(key)
+
+    def dump_ring(self) -> None:
+        print("\n=== CHORD RING ===")
+        for node in self.nodes:
+            pred_id = node.predecessor.node_id if node.predecessor else None
+            succ_id = node.successor.node_id if node.successor else None
+            print(
+                f"Node {node.node_name} | id={node.node_id} | "
+                f"pred={pred_id} | succ={succ_id} | keys={sorted(node.data_store.keys())}"
+            )
+        print("==================\n")
+
+
+class DFS:
+    """
+    DFS layer on top of the Chord ring.
+    """
+
+    GLOBAL_INDEX_KEY_RAW = "global:file_index"
+
+    def __init__(self, chord: ChordRing, page_size: int = 1024, m_bits: int = 8):
+        self.chord = chord
+        self.page_size = page_size
+        self.m_bits = m_bits
+        self.global_index_key = sha1_int(self.GLOBAL_INDEX_KEY_RAW, bits=self.m_bits)
+
+    def _hash(self, raw: str) -> int:
+        return sha1_int(raw, bits=self.m_bits)
+
+    def _metadata_key(self, filename: str) -> int:
+        return self._hash(f"metadata:{filename}")
+
+    def _page_key(self, filename: str, page_no: int) -> int:
+        return self._hash(f"{filename}:{page_no}")
+
+    def _encode(self, obj: Any) -> str:
+        return json.dumps(obj)
+
+    def _decode(self, raw: Optional[str]) -> Optional[Any]:
+        if raw is None:
+            return None
+        return json.loads(raw)
+
+    def _get_metadata(self, filename: str) -> Dict[str, Any]:
+        mkey = self._metadata_key(filename)
+        metadata = self._decode(self.chord.get(mkey))
+        if metadata is None:
+            raise FileNotFoundDFS(f"File '{filename}' not found")
+        return metadata
+
+    def _put_metadata(self, metadata: Dict[str, Any]) -> None:
+        mkey = self._metadata_key(metadata["filename"])
+        self.chord.put(mkey, self._encode(metadata))
+
+    def _get_file_index(self) -> List[str]:
+        raw = self.chord.get(self.global_index_key)
+        obj = self._decode(raw)
+        if obj is None:
+            return []
+        return obj["files"]
+
+    def _put_file_index(self, files: List[str]) -> None:
+        files = sorted(set(files))
+        self.chord.put(self.global_index_key, self._encode({"files": files}))
+
+    def _add_to_file_index(self, filename: str) -> None:
+        files = self._get_file_index()
+        if filename not in files:
+            files.append(filename)
+            self._put_file_index(files)
+
+    def _remove_from_file_index(self, filename: str) -> None:
+        files = self._get_file_index()
+        files = [f for f in files if f != filename]
+        self._put_file_index(files)
+
+    def touch(self, filename: str) -> None:
+        mkey = self._metadata_key(filename)
+        if self.chord.get(mkey) is not None:
+            raise FileAlreadyExistsDFS(f"File '{filename}' already exists")
+
+        metadata = {
+            "filename": filename,
+            "size_bytes": 0,
+            "num_pages": 0,
+            "pages": [],
+            "version": 1
+        }
+
+        self.chord.put(mkey, self._encode(metadata))
+        self._add_to_file_index(filename)
+
+    def append(self, filename: str, local_path: str) -> None:
+        if not os.path.exists(local_path):
+            raise FileNotFoundError(f"Local file '{local_path}' does not exist")
+
+        metadata = self._get_metadata(filename)
+
+        with open(local_path, "rb") as f:
+            data = f.read()
+
+        if not data:
+            return
+
+        chunks = [
+            data[i:i + self.page_size]
+            for i in range(0, len(data), self.page_size)
+        ]
+
+        for chunk in chunks:
+            page_no = metadata["num_pages"]
+            pkey = self._page_key(filename, page_no)
+
+            page_obj = {
+                "filename": filename,
+                "page_no": page_no,
+                "size_bytes": len(chunk),
+                "data": chunk.decode("latin1")
+            }
+
+            self.chord.put(pkey, self._encode(page_obj))
+
+            metadata["pages"].append({
+                "page_no": page_no,
+                "guid": pkey
+            })
+            metadata["num_pages"] += 1
+            metadata["size_bytes"] += len(chunk)
+
+        metadata["version"] += 1
+        self._put_metadata(metadata)
+
+    def read(self, filename: str) -> bytes:
+        metadata = self._get_metadata(filename)
+        output = bytearray()
+
+        for desc in sorted(metadata["pages"], key=lambda x: x["page_no"]):
+            pkey = desc["guid"]
+            page_obj = self._decode(self.chord.get(pkey))
+            if page_obj is None:
+                raise CorruptFileDFS(
+                    f"Missing page {desc['page_no']} for file '{filename}'"
+                )
+            output.extend(page_obj["data"].encode("latin1"))
+
+        return bytes(output)
+
+    def read_text(self, filename: str, encoding: str = "utf-8") -> str:
+        return self.read(filename).decode(encoding, errors="replace")
+
+    def head(self, filename: str, n: int, by_lines: bool = False) -> bytes:
+        data = self.read(filename)
+
+        if by_lines:
+            text = data.decode("utf-8", errors="replace")
+            lines = text.splitlines(keepends=True)
+            return "".join(lines[:n]).encode("utf-8")
+
+        return data[:n]
+
+    def tail(self, filename: str, n: int, by_lines: bool = False) -> bytes:
+        data = self.read(filename)
+
+        if by_lines:
+            text = data.decode("utf-8", errors="replace")
+            lines = text.splitlines(keepends=True)
+            return "".join(lines[-n:]).encode("utf-8")
+
+        if n <= 0:
+            return b""
+        return data[-n:]
+
+    def delete_file(self, filename: str) -> None:
+        metadata = self._get_metadata(filename)
+
+        for desc in metadata["pages"]:
+            self.chord.delete(desc["guid"])
+
+        self.chord.delete(self._metadata_key(filename))
+        self._remove_from_file_index(filename)
+
+    def ls(self) -> List[str]:
+        return self._get_file_index()
+
+    def stat(self, filename: str) -> Dict[str, Any]:
+        return self._get_metadata(filename)
+
+    def debug_where_is_metadata(self, filename: str) -> ChordNode:
+        return self.chord.locate_successor(self._metadata_key(filename))
+
+    def debug_where_is_page(self, filename: str, page_no: int) -> ChordNode:
+        return self.chord.locate_successor(self._page_key(filename, page_no))
+
+
+def demo():
+    ring = ChordRing(m_bits=8)
+
+    ring.add_node("node1")
+    ring.add_node("node2")
+    ring.add_node("node3")
+    ring.add_node("node4")
+    ring.add_node("node5")
+
+    dfs = DFS(ring, page_size=16, m_bits=8)
+
+    with open("sample_input.txt", "w", encoding="utf-8") as f:
+        f.write(
+            "this is a test\n"
+            "this project is for the cecs 327 class\n"
+            "we are storing pages over chord\n"
+            "last line here\n"
+        )
+
+    dfs.touch("report.txt")
+    dfs.append("report.txt", "sample_input.txt")
+
+    print("FILES:", dfs.ls())
+    print("\nSTAT(report.txt):")
+    print(json.dumps(dfs.stat("report.txt"), indent=2))
+
+    print("\nFULL READ:")
+    print(dfs.read_text("report.txt"))
+
+    print("\nHEAD 20 BYTES:")
+    print(dfs.head("report.txt", 20).decode("utf-8", errors="replace"))
+
+    print("\nTAIL 2 LINES:")
+    print(dfs.tail("report.txt", 2, by_lines=True).decode("utf-8", errors="replace"))
+
+    owner = dfs.debug_where_is_metadata("report.txt")
+    print(f"Metadata for report.txt is stored at node {owner.node_name} (id={owner.node_id})")
+
+    page0_owner = dfs.debug_where_is_page("report.txt", 0)
+    print(f"Page 0 for report.txt is stored at node {page0_owner.node_name} (id={page0_owner.node_id})")
+
+    ring.dump_ring()
+
+    dfs.delete_file("report.txt")
+    print("FILES AFTER DELETE:", dfs.ls())
+
+    ring.dump_ring()
+
+
+if __name__ == "__main__":
+    demo()
