@@ -26,6 +26,74 @@ class CorruptFileDFS(DFSException):
     pass
 
 
+class PaxosCommitFailed(DFSException):
+    pass
+
+
+class PaxosReplica:
+    def __init__(self, replica_name: str):
+        self.replica_name = replica_name
+        self.accepted: Dict[int, Any] = {}
+        self.learned: Dict[int, Any] = {}
+        self.log: List[tuple] = []
+
+    def on_accept(self, proposal_no: int, operation: Dict[str, Any]) -> bool:
+        print(f"[PAXOS][{self.replica_name}] ACCEPT({proposal_no}, {operation['op']})")
+        self.accepted[proposal_no] = operation
+        return True
+
+    def on_learn(self, proposal_no: int, operation: Dict[str, Any]) -> bool:
+        print(f"[PAXOS][{self.replica_name}] LEARN({proposal_no}, {operation['op']})")
+        self.learned[proposal_no] = operation
+        self.log.append((proposal_no, operation))
+        return True
+
+
+class PaxosCluster:
+    def __init__(self, replicas: List[PaxosReplica]):
+        if len(replicas) < 3:
+            raise ValueError("Need at least 3 replicas for majority-based commitment")
+        self.replicas = replicas
+        self.leader = replicas[0]
+        self.proposal_no = 0
+        self.committed: List[tuple] = []
+
+    def commit(self, operation: Dict[str, Any]) -> bool:
+        self.proposal_no += 1
+        t = self.proposal_no
+        majority = len(self.replicas) // 2 + 1
+
+        print(f"[PAXOS][LEADER={self.leader.replica_name}] PROPOSE({t}, {operation})")
+
+        accepted_replicas = []
+        for replica in self.replicas:
+            ok = replica.on_accept(t, operation)
+            if ok:
+                accepted_replicas.append(replica)
+
+        learned_count = 0
+        for replica in accepted_replicas:
+            ok = replica.on_learn(t, operation)
+            if ok:
+                learned_count += 1
+
+        if learned_count >= majority:
+            self.committed.append((t, operation))
+            print(f"[PAXOS][LEADER={self.leader.replica_name}] COMMIT({t}, {operation['op']})")
+            return True
+
+        print(f"[PAXOS][LEADER={self.leader.replica_name}] ABORT({t}, {operation['op']})")
+        return False
+
+    def dump_logs(self) -> None:
+        print("\n=== PAXOS LOGS ===")
+        for replica in self.replicas:
+            print(f"Replica {replica.replica_name}:")
+            for proposal_no, operation in replica.log:
+                print(f"  t={proposal_no} op={operation}")
+        print("==================\n")
+
+
 class ChordNode:
     # Minimal Chord-like peer. Stores keys that map to it as the successor node on the ring.
 
@@ -156,12 +224,12 @@ class DFS:
 
     GLOBAL_INDEX_KEY_RAW = "global:file_index"
 
-    def __init__(self, chord: ChordRing, page_size: int = 1024, m_bits: int = 8):
+    def __init__(self, chord: ChordRing, page_size: int = 1024, m_bits: int = 8, paxos: Optional[PaxosCluster] = None):
         self.chord = chord
         self.page_size = page_size
         self.m_bits = m_bits
         self.global_index_key = sha1_int(self.GLOBAL_INDEX_KEY_RAW, bits=self.m_bits)
-
+        self.paxos = paxos
     def _hash(self, raw: str) -> int:
         return sha1_int(raw, bits=self.m_bits)
 
@@ -178,6 +246,13 @@ class DFS:
         if raw is None:
             return None
         return json.loads(raw)
+
+    def _replicate_update(self, operation: Dict[str, Any]) -> None:
+        if self.paxos is None:
+            return
+        committed = self.paxos.commit(operation)
+        if not committed:
+            raise PaxosCommitFailed(f"Paxos failed to commit operation: {operation}")
 
     def _get_metadata(self, filename: str) -> Dict[str, Any]:
         mkey = self._metadata_key(filename)
@@ -216,6 +291,7 @@ class DFS:
         mkey = self._metadata_key(filename)
         if self.chord.get(mkey) is not None:
             raise FileAlreadyExistsDFS(f"File '{filename}' already exists")
+        self._replicate_update({"op": "touch", "filename": filename})
 
         metadata = {
             "filename": filename,
@@ -244,6 +320,13 @@ class DFS:
             data[i:i + self.page_size]
             for i in range(0, len(data), self.page_size)
         ]
+        self._replicate_update({
+            "op": "append",
+            "filename": filename,
+            "bytes": len(data),
+            "new_pages": len(chunks),
+            "starting_page_no": metadata["num_pages"]
+        })
 
         for chunk in chunks:
             page_no = metadata["num_pages"]
@@ -310,6 +393,12 @@ class DFS:
 
     def delete_file(self, filename: str) -> None:
         metadata = self._get_metadata(filename)
+
+        self._replicate_update({
+            "op": "delete_file",
+            "filename": filename,
+            "pages": metadata["num_pages"]
+        })
 
         for desc in metadata["pages"]:
             self.chord.delete(desc["guid"])
@@ -386,6 +475,13 @@ class DFS:
         if out:
             out += "\n"
 
+        self._replicate_update({
+            "op": "sort_file",
+            "input": filename,
+            "output": output_filename,
+            "records": len(all_records)
+        })
+
         self._save_to_dfs(output_filename, out)
 
         for node in self.chord.nodes:
@@ -401,8 +497,14 @@ def demo():
     ring.add_node("node4")
     ring.add_node("node5")
 
-    dfs = DFS(ring, page_size=16, m_bits=8)
+    replicas = [
+        PaxosReplica("replica1"),
+        PaxosReplica("replica2"),
+        PaxosReplica("replica3")
+    ]
+    paxos = PaxosCluster(replicas)
 
+    dfs = DFS(ring, page_size=16, m_bits=8, paxos=paxos)
     with open("sample_input.txt", "w", encoding="utf-8") as f:
         f.write(
             "this is a test\n"
@@ -467,6 +569,8 @@ def demo():
     keys = [int(line.split(",")[0]) for line in sorted_text.strip().splitlines()]
     assert keys == sorted(keys), "FAIL: not sorted"
     print("\ncorrectness check passed, keys:", keys)
+    paxos.dump_logs()  # PAXOS - add this
+
 
 
 if __name__ == "__main__":
