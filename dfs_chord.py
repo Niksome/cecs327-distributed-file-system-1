@@ -36,14 +36,23 @@ class PaxosReplica:
         self.accepted: Dict[int, Any] = {}
         self.learned: Dict[int, Any] = {}
         self.log: List[tuple] = []
+        self.alive = True
 
     def on_accept(self, proposal_no: int, operation: Dict[str, Any]) -> bool:
-        print(f"[PAXOS][{self.replica_name}] ACCEPT({proposal_no}, {operation['op']})")
+        if not self.alive:
+            print(f"[PAXOS][{self.replica_name}] NO RESPONSE - CRASHED")
+            return False
+
+        print(f"[PAXOS][{self.replica_name}] ACCEPT(op={operation['op']}, t={proposal_no})")
         self.accepted[proposal_no] = operation
         return True
 
     def on_learn(self, proposal_no: int, operation: Dict[str, Any]) -> bool:
-        print(f"[PAXOS][{self.replica_name}] LEARN({proposal_no}, {operation['op']})")
+        if not self.alive:
+            print(f"[PAXOS][{self.replica_name}] NO LEARN - CRASHED")
+            return False
+
+        print(f"[PAXOS][{self.replica_name}] LEARN(op={operation['op']}, t={proposal_no})")
         self.learned[proposal_no] = operation
         self.log.append((proposal_no, operation))
         return True
@@ -63,26 +72,39 @@ class PaxosCluster:
         t = self.proposal_no
         majority = len(self.replicas) // 2 + 1
 
-        print(f"[PAXOS][LEADER={self.leader.replica_name}] PROPOSE({t}, {operation})")
+        print(f"[PAXOS][LEADER={self.leader.replica_name}] PROPOSE(op={operation['op']}, t={t})")
 
         accepted_replicas = []
+
+        # === ACCEPT PHASE ===
         for replica in self.replicas:
             ok = replica.on_accept(t, operation)
             if ok:
                 accepted_replicas.append(replica)
 
+        print(f"[PAXOS] ACCEPTED {len(accepted_replicas)}/{len(self.replicas)}")
+
+        # require majority BEFORE learning
+        if len(accepted_replicas) < majority:
+            print(f"[PAXOS] ABORT(op={operation['op']}, t={t})")
+            return False
+
+        # === LEARN PHASE ===
         learned_count = 0
         for replica in accepted_replicas:
             ok = replica.on_learn(t, operation)
             if ok:
                 learned_count += 1
 
+        print(f"[PAXOS] LEARNED {learned_count}/{len(self.replicas)}")
+
+        # === COMMIT ===
         if learned_count >= majority:
             self.committed.append((t, operation))
-            print(f"[PAXOS][LEADER={self.leader.replica_name}] COMMIT({t}, {operation['op']})")
+            print(f"[PAXOS] COMMIT(op={operation['op']}, t={t})")
             return True
 
-        print(f"[PAXOS][LEADER={self.leader.replica_name}] ABORT({t}, {operation['op']})")
+        print(f"[PAXOS] ABORT(op={operation['op']}, t={t})")
         return False
 
     def dump_logs(self) -> None:
@@ -92,8 +114,6 @@ class PaxosCluster:
             for proposal_no, operation in replica.log:
                 print(f"  t={proposal_no} op={operation}")
         print("==================\n")
-
-
 class ChordNode:
     # Minimal Chord-like peer. Stores keys that map to it as the successor node on the ring.
 
@@ -569,6 +589,14 @@ def demo():
     keys = [int(line.split(",")[0]) for line in sorted_text.strip().splitlines()]
     assert keys == sorted(keys), "FAIL: not sorted"
     print("\ncorrectness check passed, keys:", keys)
+    print("\n=== FAILURE DEMO: replica3 crashes ===")
+    replicas[2].alive = False
+
+    with open("failure_append.txt", "w", encoding="utf-8") as f:
+        f.write("999,failure-demo\n")
+
+    dfs.append("records.csv", "failure_append.txt")
+    print("Append still committed with 2/3 Paxos replicas alive.")
     paxos.dump_logs()  # PAXOS - add this
 
 
